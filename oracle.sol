@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
-
+import "@openzeppelin/contracts/access/Ownable.sol";
 
     interface AggregatorV3Interface {
         function decimals() external view returns (uint8);
@@ -64,9 +64,13 @@ pragma solidity ^0.8.0;
 
 
 
-    contract DataRetrievalContract {
+    contract DataRetrievalContract is Ownable {
 
-        constructor() {
+        address public updater = address(0);
+        uint256 public GMETHprice = 0;
+        uint256 public GMBTCprice = 0;
+
+        constructor() Ownable(msg.sender) {
         
         }
 
@@ -82,6 +86,43 @@ pragma solidity ^0.8.0;
 
             return answer;
         }
+
+
+
+        function setUpdater(address _updater) external onlyOwner {
+            updater = _updater;
+        }
+
+        function updateGMETHprice(uint256 price) external {
+            require(msg.sender == updater);
+            require(price >= 0 && price <=1e27, "out of range");
+            GMETHprice = price;
+        }
+
+        function updateGMBTCprice(uint256 price) external {
+            require(msg.sender == updater);
+            require(price >= 0 && price <=1e27, "out of range");
+            GMBTCprice = price;
+        }
+
+        function getGMETHprice() public view returns(uint256) {
+            return GMETHprice;
+        }
+
+        
+        function getGMBTCprice() public view returns(uint256) {
+            return GMBTCprice;
+        }
+
+        function getAssetPrice() public view returns(uint256) {
+            return uint256(getAnswerFromPriceContract(0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612));
+        }
+
+        function getStableAssetPrice() public pure returns(uint256) {
+            return 1e8;
+        }
+
+
 
         // Function to retrieve the amount using the reader contract
         function retrieveETHUSDCAmount(int256 price) external view returns (uint256, uint256) {

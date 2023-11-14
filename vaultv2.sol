@@ -19,6 +19,13 @@ pragma solidity ^0.8.20;
     function decimals() external  view returns (uint8);
     }
 
+    interface oracle {
+        function getGMETHprice() external  view returns(uint256);
+        function getGMBTCprice() external  view returns(uint256);
+        function getAssetPrice() external view returns(uint256);
+        function getStableAssetPrice() external pure returns(uint256);
+    }
+
     // Define the interface for the exchange router
     interface IExchangeRouter {
         struct CreateDepositParams {
@@ -73,6 +80,7 @@ pragma solidity ^0.8.20;
         uint256 lastUpdate; 
         uint256 vaultcap;
         uint256 depositFees;
+        uint256 withdrawFees;
         uint256 APR;
         bool stakable;
         bool withdrawable;
@@ -91,6 +99,7 @@ pragma solidity ^0.8.20;
         using SafeMath for uint256;
 
         address public rebalanceRole;
+        oracle public Oracle;
 
         // Declare a variable to hold the ExchangeRouter address
         address public exchangeRouter;
@@ -98,6 +107,7 @@ pragma solidity ^0.8.20;
 
         IERC20 public WETH = IERC20(0x82aF49447D8a07e3bd95BD0d56f35241523fBab1);
         IERC20 public USDC = IERC20(0xaf88d065e77c8cC2239327C5EDb3A432268e5831);
+        address GMarketAddress = 0x70d95587d40A2caf56bd97485aB3Eec10Bee6336;
 
         struct UserWithdrawAmount {
             uint256 ethAmount;
@@ -116,9 +126,26 @@ pragma solidity ^0.8.20;
 
 
         mapping(address => UserWithdrawAmount) public withdrawMap;
-        constructor(address _rebalancer, address _exchangeRouter, GDtoken _gdUSDC, GDtoken _gdETH) Ownable(msg.sender) {
+        constructor(address _oracle, address _exchangeRouter, GDtoken _gdUSDC, GDtoken _gdETH) Ownable(msg.sender) {
             exchangeRouter = _exchangeRouter;
-            rebalanceRole = _rebalancer;
+            rebalanceRole = msg.sender;
+            Oracle = oracle(_oracle);
+
+            poolInfo.push(PoolInfo({
+                lpToken: USDC,
+                GDlptoken: _gdUSDC,
+                totalStaked:0,
+                EarnRateSec:0,
+                lastUpdate: block.timestamp,
+                vaultcap: 0,
+                stakable: true,
+                withdrawable: true,
+                rewardStart: false,
+                depositFees: 250, 
+                withdrawFees: 250, 
+                APR: 1000
+                
+            }));
 
             poolInfo.push(PoolInfo({
                 lpToken: WETH,
@@ -127,35 +154,35 @@ pragma solidity ^0.8.20;
                 EarnRateSec:0,
                 lastUpdate: block.timestamp,
                 vaultcap: 0,
-                stakable: false,
-                withdrawable: false,
+                stakable: true,
+                withdrawable: true,
                 rewardStart: false,
-                depositFees: 250, 
+                depositFees: 250,
+                withdrawFees: 250, 
                 APR: 800
                 
             }));
 
             
-            poolInfo.push(PoolInfo({
-                lpToken: USDC,
-                GDlptoken: _gdUSDC,
-                totalStaked:0,
-                EarnRateSec:0,
-                lastUpdate: block.timestamp,
-                vaultcap: 0,
-                stakable: false,
-                withdrawable: false,
-                rewardStart: false,
-                depositFees: 260, 
-                APR: 1000
-                
-            }));
+          
         }
 
         address wntReceiver = 0xF89e77e8Dc11691C9e8757e84aaFbCD8A67d7A55;
         address wntReceiverWithdraw = 0x0628D46b5D145f183AdB6Ef1f2c97eD1C4701C55;
 
         receive() external payable {}
+
+        function updateOracle(oracle _oracle) external onlyOwner{
+            Oracle = _oracle;
+        }
+
+        function updateRebalancer(address _rebalance) external onlyOwner{
+            rebalanceRole = _rebalance;
+        }
+
+        function Router(address _router) external onlyOwner{
+            exchangeRouter = _router;
+        }
 
         function getWithdrawETHneeded() external view returns(uint256){
             if (totalPendingWithdraw.ethAmount >= WETH.balanceOf(address(this))){
@@ -206,6 +233,11 @@ pragma solidity ^0.8.20;
             poolInfo[_pid].depositFees = _percent;
         }
 
+        function setWithdrawFees(uint256 _pid, uint256 _percent) external onlyOwner {
+            require(_percent < 1000, "not in range");
+            poolInfo[_pid].withdrawFees = _percent;
+        }
+
         // Unlocks the staked + gained USDC and burns xUSDC
         function updatePool(uint256 _pid) internal {
             uint256 timepass = block.timestamp.sub(poolInfo[_pid].lastUpdate);
@@ -222,6 +254,13 @@ pragma solidity ^0.8.20;
                 reward = poolInfo[_pid].EarnRateSec.mul(timepass);
             }
             return poolInfo[_pid].totalStaked.add(reward);
+        }
+
+        function displayStakedBalance(address _address, uint256 _pid) public view returns(uint256) {
+            GDtoken GDT = poolInfo[_pid].GDlptoken;
+            uint256 totalShares = GDT.totalSupply();
+            uint256 amountOut = GDT.balanceOf(_address).mul(currentPoolTotal(_pid)).div(totalShares);
+            return amountOut;
         }
 
         function updatePoolRate(uint256 _pid) internal {
@@ -345,8 +384,6 @@ pragma solidity ^0.8.20;
             poolInfo[_pid].totalStaked = poolInfo[_pid].totalStaked.add(amountAfterFee);
 
             updatePoolRate(_pid);
-        
-            
             StakedToken.safeTransferFrom(msg.sender, address(this), _amountin);       
         }
 
@@ -370,24 +407,27 @@ pragma solidity ^0.8.20;
 
             poolInfo[_pid].totalStaked = poolInfo[_pid].totalStaked.sub(amountOut);
             updatePoolRate(_pid);
-            GDT.transferFrom(msg.sender, address(this), _share);
 
             uint256 amountSendOut = amountOut;
 
             uint256 decimalMul = 18 - IERC20Extented(address(StakedToken)).decimals();
             
             //decimals handlin
-            amountSendOut = amountOut.div(10**decimalMul);     
-            if (_pid == 0){
+            amountSendOut = amountOut.div(10**decimalMul);   
+            uint256 balanceMultipier = 100000 - poolInfo[_pid].withdrawFees;
+            amountSendOut = amountSendOut.mul(balanceMultipier).div(100000);
+
+            GDT.burn(msg.sender, _share);
+
+            if (_pid == 1){
                 withdrawMap[msg.sender].ethAmount = withdrawMap[msg.sender].ethAmount.add(amountSendOut);
-                withdrawMap[msg.sender].burnEthGDAmount = withdrawMap[msg.sender].burnEthGDAmount.add(_share);
+       
                 totalPendingWithdraw.ethAmount = totalPendingWithdraw.ethAmount.add(amountSendOut); 
 
 
             }
             else {
                 withdrawMap[msg.sender].usdcAmount = withdrawMap[msg.sender].usdcAmount.add(amountSendOut);
-                withdrawMap[msg.sender].burnUsdcGDAmount = withdrawMap[msg.sender].burnUsdcGDAmount.add(_share);
                 totalPendingWithdraw.usdcAmount = totalPendingWithdraw.usdcAmount.add(amountSendOut); 
             }
             
@@ -406,19 +446,14 @@ pragma solidity ^0.8.20;
            uint256 ethAmountSendOut = withdrawMap[msg.sender].ethAmount;
            uint256 usdcAmountSendOut = withdrawMap[msg.sender].usdcAmount;
            
-           uint256 GDburnETH =  withdrawMap[msg.sender].burnEthGDAmount;
-           uint256 GDburnUSDC =  withdrawMap[msg.sender].burnUsdcGDAmount;
+ 
 
            resetUserWithdraw(msg.sender);
            totalPendingWithdraw.ethAmount = totalPendingWithdraw.ethAmount.sub(ethAmountSendOut);
-           totalPendingWithdraw.usdcAmount = totalPendingWithdraw.ethAmount.sub(usdcAmountSendOut);
+           totalPendingWithdraw.usdcAmount = totalPendingWithdraw.usdcAmount.sub(usdcAmountSendOut);
 
-           GDtoken GDTeth = poolInfo[0].GDlptoken;
-           GDtoken GDTusdc = poolInfo[1].GDlptoken;
-           GDTeth.burn(address(this),GDburnETH);
-           GDTusdc.burn(address(this), GDburnUSDC);
            WETH.safeTransfer(msg.sender, ethAmountSendOut);
-           WETH.safeTransfer(msg.sender, usdcAmountSendOut);
+           USDC.safeTransfer(msg.sender, usdcAmountSendOut);
 
         }
 
@@ -429,64 +464,61 @@ pragma solidity ^0.8.20;
 
         }
 
-        // Function to test deposit by calling multiple functions on ExchangeRouter
-        function testDeposit() external payable  {
-            // Replace these values with your desired addresses and amounts
-            
-            uint256 wntAmount = 700000000000000;
-
-            address tokenReceiver = 0xF89e77e8Dc11691C9e8757e84aaFbCD8A67d7A55;
-            uint256 tokenAmount = 100;
-            address tokenAddress = 0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f;
-
-            address shortTokenReceiver = 0xF89e77e8Dc11691C9e8757e84aaFbCD8A67d7A55;
-            uint256 shortTokenAmount = 10000;
-            address shortTokenAddress = 0xaf88d065e77c8cC2239327C5EDb3A432268e5831;
-
-            IERC20(tokenAddress).approve(0x7452c558d45f8afC8c83dAe62C3f8A5BE19c71f6, tokenAmount);
-            IERC20(shortTokenAddress).approve(0x7452c558d45f8afC8c83dAe62C3f8A5BE19c71f6, shortTokenAmount);
-
-            // Create the CreateDepositParams struct with your desired values
-            IExchangeRouter.CreateDepositParams memory depositParams = IExchangeRouter.CreateDepositParams(
-                address(this), // Replace with receiver address
-                address(0x0000000000000000000000000000000000000000), // Replace with callbackContract address
-                address(0x0000000000000000000000000000000000000000), // Replace with uiFeeReceiver address
-                address(0x47c031236e19d024b42f8AE6780E44A573170703), // Replace with market address
-                tokenAddress, // Replace with initialLongToken address
-                shortTokenAddress, // Replace with initialShortToken address
-                new address[](0), // Replace with longTokenSwapPath if needed
-                new address[](0), // Replace with shortTokenSwapPath if needed
-                0, // Replace with minMarketTokens
-                false, // Replace with shouldUnwrapNativeToken (true or false)
-                wntAmount, // Replace with executionFee
-                0 // Replace with callbackGasLimit
-            );
-
-            // Call the functions on ExchangeRouter
-            IExchangeRouter(exchangeRouter).sendWnt{value: wntAmount}(wntReceiver, wntAmount);
-            IExchangeRouter(exchangeRouter).sendTokens(tokenAddress, tokenReceiver, tokenAmount);
-            IExchangeRouter(exchangeRouter).sendTokens(shortTokenAddress, shortTokenReceiver, shortTokenAmount);
-            IExchangeRouter(exchangeRouter).createDeposit(depositParams);
-            
+        function totalUSDvault() public view returns(uint256) {
+            uint256 tokenPrice = Oracle.getAssetPrice();
+            uint256 StablePrice = Oracle.getStableAssetPrice();
+            uint256 totalStakedTokens = currentPoolTotal(1);
+            uint256 totalStableStakedTokens = currentPoolTotal(0);
+            uint256 totalUSD = tokenPrice.mul(totalStakedTokens).div(10**18); //decials 8 
+            uint256 totalUSD2 = StablePrice.mul(totalStableStakedTokens).div(10**18); //decials 8 
+            return totalUSD.add(totalUSD2);
         }
 
+        function totalGMUSD() public view returns(uint256) {            
+            uint256 GMprice = Oracle.getGMETHprice();
+            uint256 GMamount = IERC20(GMarketAddress).balanceOf(address(this));
+            return GMamount.mul(GMprice).div(10**28); //decials 8 
+        }
+
+        function withdrawProfit(IERC20 token, uint256 _amount) external onlyOwner {
+            require(totalGMUSD() > totalUSDvault(), "undervalue");
+            require(token != IERC20(GMarketAddress), "cant withdraw backing");
+            token.transfer(owner(), _amount);
+        }
+
+        function withdrawARB(uint256 _amount) external onlyOwner {
+            IERC20 token = IERC20(0x912CE59144191C1204E64559FE8253a0e49E6548);
+            token.transfer(owner(), _amount);
+        }
+
+        // Function to withdraw all Ether from this contract to the owner
+        function withdrawETH() external onlyOwner {
+            uint256 balance = address(this).balance;
+            require(balance > 0, "Contract balance is zero");
+
+            (bool sent, ) = payable(owner()).call{value: balance}("");
+            require(sent, "Failed to send Ether");
+        }
                 // Function to test deposit by calling multiple functions on ExchangeRouter
-        function testDeposit2(uint256 wntAmount, uint256 tokenAmount, uint256 shortTokenAmount) external payable  {
+        function BuyGMtokens(uint256 wntAmount, uint256 tokenAmount, uint256 shortTokenAmount) external payable  {
+
+            require(msg.sender ==  rebalanceRole,"not rebalancer");
             // Replace these values with your desired addresses and amounts        
             address tokenReceiver = 0xF89e77e8Dc11691C9e8757e84aaFbCD8A67d7A55;
-            address tokenAddress = 0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f;
+            address tokenAddress = address(WETH);
             address shortTokenReceiver = 0xF89e77e8Dc11691C9e8757e84aaFbCD8A67d7A55;
             address shortTokenAddress = 0xaf88d065e77c8cC2239327C5EDb3A432268e5831;
 
-            _testDeposit2(wntAmount, tokenReceiver, tokenAddress, 
+            _buyGMtokens(wntAmount, tokenReceiver, tokenAddress, 
             tokenAmount, shortTokenReceiver, shortTokenAddress, shortTokenAmount, 
-            address(0), address(0), address(0x47c031236e19d024b42f8AE6780E44A573170703));
+            address(0), address(0), GMarketAddress);
             
         }
 
-        function _testDeposit2(uint256 wntAmount, 
+        function _buyGMtokens(uint256 wntAmount, 
             address tokenReceiver, address token1, uint256 amount1, address token2Receiver, address token2, 
-            uint256 amount2, address callback, address uiFeeReceiverAddress, address marketAddress) public payable  {
+            uint256 amount2, address callback, address uiFeeReceiverAddress, address marketAddress) internal  {
+
            
             IERC20(token1).approve(0x7452c558d45f8afC8c83dAe62C3f8A5BE19c71f6, amount1);
             IERC20(token2).approve(0x7452c558d45f8afC8c83dAe62C3f8A5BE19c71f6, amount2);
@@ -508,54 +540,27 @@ pragma solidity ^0.8.20;
             );
 
             // Call the functions on ExchangeRouter
-            IExchangeRouter(exchangeRouter).sendWnt{value: wntAmount}(wntReceiverWithdraw, wntAmount);
+            IExchangeRouter(exchangeRouter).sendWnt{value: wntAmount}(wntReceiver, wntAmount);
             IExchangeRouter(exchangeRouter).sendTokens(token1, tokenReceiver, amount1);
             IExchangeRouter(exchangeRouter).sendTokens(token2, token2Receiver, amount2);
             IExchangeRouter(exchangeRouter).createDeposit(depositParams);
         }
 
-                // Function to test withdrawal by calling multiple functions on ExchangeRouter
-        function testWithdrawal(uint256 wntAmount, uint256 tokenAmount) external payable  {
+
+        function SwapToAssets(uint256 wntAmount, uint256 tokenAmount) external payable  {
+
+            require(msg.sender ==  rebalanceRole,"not rebalancer");
             // Replace these values with your desired addresses and amounts
 
             address tokenReceiver = 0x0628D46b5D145f183AdB6Ef1f2c97eD1C4701C55;
-            address tokenAddress = 0x47c031236e19d024b42f8AE6780E44A573170703;
+            address tokenAddress = GMarketAddress;
 
-            IERC20(tokenAddress).approve(0x7452c558d45f8afC8c83dAe62C3f8A5BE19c71f6, tokenAmount);
-
-            // Create the CreateWithdrawalParams struct with your desired values
-            IExchangeRouter.CreateWithdrawalParams memory withdrawalParams = IExchangeRouter.CreateWithdrawalParams(
-                address(this), // Replace with receiver address
-                address(0x0000000000000000000000000000000000000000), // Replace with callbackContract address
-                address(0x0000000000000000000000000000000000000000), // Replace with uiFeeReceiver address
-                tokenAddress, // Replace with market address
-                new address[](0),// Replace with longTokenSwapPath if needed
-                new address[](0), // Replace with shortTokenSwapPath if needed
-                0, // Replace with minLongTokenAmount
-                0, // Replace with minShortTokenAmount
-                false, // Replace with shouldUnwrapNativeToken (true or false)
-                wntAmount, // Replace with executionFee
-                0 // Replace with callbackGasLimit
-            );
-
-            // Call the functions on ExchangeRouter
-            IExchangeRouter(exchangeRouter).sendWnt{value: wntAmount}(wntReceiverWithdraw, wntAmount);
-            IExchangeRouter(exchangeRouter).sendTokens(tokenAddress, tokenReceiver, tokenAmount);
-            IExchangeRouter(exchangeRouter).createWithdrawal(withdrawalParams);
-        }
-
-        function testWithdrawal2(uint256 wntAmount, uint256 tokenAmount) external payable  {
-            // Replace these values with your desired addresses and amounts
-
-            address tokenReceiver = 0x0628D46b5D145f183AdB6Ef1f2c97eD1C4701C55;
-            address tokenAddress = 0x47c031236e19d024b42f8AE6780E44A573170703;
-
-            customWithdrawal(wntAmount, tokenReceiver,tokenAmount,tokenAddress,address(0),address(0),wntAmount);
+            _swapToAssets(wntAmount, tokenReceiver,tokenAmount,tokenAddress,address(0),address(0),wntAmount);
         }
 
 
         // Function to test withdrawal with customizable parameters
-        function customWithdrawal(
+        function _swapToAssets(
             uint256 wntAmount,
             address tokenReceiver,
             uint256 tokenAmount,
@@ -564,7 +569,7 @@ pragma solidity ^0.8.20;
             address uiFeeReceiverAddress,
             uint256 executionFee
         
-        ) public payable {
+        ) internal {
             // Approve token transfers
             IERC20(tokenAddress).approve(0x7452c558d45f8afC8c83dAe62C3f8A5BE19c71f6, tokenAmount);
 
@@ -584,7 +589,7 @@ pragma solidity ^0.8.20;
             );
 
             // Call the functions on ExchangeRouter
-            IExchangeRouter(exchangeRouter).sendWnt{value: wntAmount}(wntReceiver, wntAmount);
+            IExchangeRouter(exchangeRouter).sendWnt{value: wntAmount}(wntReceiverWithdraw, wntAmount);
             IExchangeRouter(exchangeRouter).sendTokens(tokenAddress, tokenReceiver, tokenAmount);
             IExchangeRouter(exchangeRouter).createWithdrawal(withdrawalParams);
         }
